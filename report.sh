@@ -2,68 +2,137 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RESULT_JSON="${SCRIPT_DIR}/result.json"
 MEMBERS_JSON="${SCRIPT_DIR}/members.json"
 
+ORG_ID="org_swbgSzieLIzJ9xLY"
+API_BASE="https://api.devin.ai/v3/organizations/${ORG_ID}/sessions"
+
 usage() {
-  echo "Usage: $0 <start_date> <end_date>" >&2
-  echo "  Dates in YYYY-MM-DD format (JST)" >&2
-  echo "  Example: $0 2025-03-10 2025-03-14" >&2
+  echo "Usage: $0 <days>" >&2
+  echo "  days: Number of past days to report (positive integer)" >&2
+  echo "  Example: $0 5  (report sessions from the past 5 days)" >&2
   exit 1
 }
 
-if [[ $# -ne 2 ]]; then
+if [[ $# -ne 1 ]]; then
   usage
 fi
 
-START_DATE="$1"
-END_DATE="$2"
+DAYS="$1"
 
-if ! [[ "$START_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || ! [[ "$END_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-  echo "Error: Dates must be in YYYY-MM-DD format." >&2
+if ! [[ "$DAYS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: days must be a positive integer." >&2
   usage
 fi
 
-if ! command -v jq &>/dev/null; then
-  echo "Error: jq is required. Install it with: brew install jq" >&2
-  exit 1
-fi
-
-# Convert YYYY-MM-DD to epoch (supports both macOS BSD date and GNU date)
-to_epoch() {
-  local datetime="$1"
-  if date -j -f "%Y-%m-%d %H:%M:%S" "$datetime" "+%s" 2>/dev/null; then
-    return
-  fi
-  date -d "$datetime" "+%s" 2>/dev/null && return
-  echo "Error: Cannot parse date: $datetime" >&2
-  exit 1
-}
-
-START_EPOCH=$(TZ=Asia/Tokyo to_epoch "${START_DATE} 00:00:00")
-END_EPOCH=$(TZ=Asia/Tokyo to_epoch "${END_DATE} 23:59:59")
-
-if [[ "$START_EPOCH" -gt "$END_EPOCH" ]]; then
-  echo "Error: start_date must be before or equal to end_date." >&2
-  exit 1
-fi
-
-for f in "$RESULT_JSON" "$MEMBERS_JSON"; do
-  if [[ ! -f "$f" ]]; then
-    echo "Error: File not found: $f" >&2
+for cmd in jq curl; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Error: ${cmd} is required." >&2
     exit 1
   fi
 done
 
-jq -r --argjson start "$START_EPOCH" \
-      --argjson end "$END_EPOCH" \
-      --slurpfile members "$MEMBERS_JSON" \
+if [[ -z "${DEVIN_API_KEY:-}" ]]; then
+  echo "Error: DEVIN_API_KEY environment variable is not set." >&2
+  exit 1
+fi
+
+if [[ ! -f "$MEMBERS_JSON" ]]; then
+  echo "Error: File not found: $MEMBERS_JSON" >&2
+  exit 1
+fi
+
+# Calculate the epoch timestamp for N days ago at 00:00:00 JST
+calc_start_epoch() {
+  local days="$1"
+  if date -j -f "%Y-%m-%d %H:%M:%S" "2000-01-01 00:00:00" "+%s" &>/dev/null; then
+    # macOS BSD date
+    local target_date
+    target_date=$(TZ=Asia/Tokyo date -j -v "-${days}d" "+%Y-%m-%d")
+    TZ=Asia/Tokyo date -j -f "%Y-%m-%d %H:%M:%S" "${target_date} 00:00:00" "+%s"
+  else
+    # GNU date
+    local target_date
+    target_date=$(TZ=Asia/Tokyo date -d "${days} days ago" "+%Y-%m-%d")
+    TZ=Asia/Tokyo date -d "${target_date} 00:00:00" "+%s"
+  fi
+}
+
+START_EPOCH=$(calc_start_epoch "$DAYS")
+
+TMPDIR_WORK=$(mktemp -d)
+trap 'rm -rf "$TMPDIR_WORK"' EXIT
+
+ALL_ITEMS="${TMPDIR_WORK}/all_items.json"
+echo '[]' > "$ALL_ITEMS"
+
+cursor=""
+page=1
+MAX_PAGES=100
+
+while true; do
+  url="${API_BASE}?first=200&created_after=${START_EPOCH}"
+  if [[ -n "$cursor" ]]; then
+    encoded_cursor=$(echo -n "$cursor" | jq -sRr @uri)
+    url="${url}&after=${encoded_cursor}"
+  fi
+
+  echo "Fetching page ${page}..." >&2
+
+  http_code=$(curl --silent --output "${TMPDIR_WORK}/response.json" \
+    --write-out "%{http_code}" \
+    --max-time 30 --connect-timeout 10 \
+    --request GET \
+    --url "$url" \
+    --header "Authorization: Bearer ${DEVIN_API_KEY}")
+
+  if [[ "$http_code" -ne 200 ]]; then
+    echo "Error: API returned HTTP ${http_code}" >&2
+    cat "${TMPDIR_WORK}/response.json" >&2
+    echo >&2
+    exit 1
+  fi
+
+  response=$(<"${TMPDIR_WORK}/response.json")
+
+  items=$(echo "$response" | jq '.items // []')
+  if [[ $(echo "$items" | jq 'type') != '"array"' ]]; then
+    echo "Error: Unexpected API response (items is not an array)" >&2
+    exit 1
+  fi
+
+  has_next=$(echo "$response" | jq -r '.has_next_page')
+  end_cursor=$(echo "$response" | jq -r '.end_cursor // empty')
+
+  merged=$(jq -s '.[0] + .[1]' "$ALL_ITEMS" <(echo "$items"))
+  echo "$merged" > "$ALL_ITEMS"
+
+  count=$(echo "$items" | jq 'length')
+  total=$(jq 'length' "$ALL_ITEMS")
+  echo "  Got ${count} sessions (total: ${total})" >&2
+
+  if [[ "$has_next" != "true" ]]; then
+    break
+  fi
+
+  if [[ "$page" -ge "$MAX_PAGES" ]]; then
+    echo "Warning: Reached maximum page limit (${MAX_PAGES}). Results may be incomplete." >&2
+    break
+  fi
+
+  cursor="$end_cursor"
+  page=$((page + 1))
+done
+
+total=$(jq 'length' "$ALL_ITEMS")
+echo "Fetched ${total} sessions total." >&2
+
+jq -r --slurpfile members "$MEMBERS_JSON" \
 '
   # Build user_id -> name lookup from members array
   ($members[0] | map({(.user_id): .name}) | add // {}) as $user_map |
 
-  .items[]
-  | select(.created_at >= $start and .created_at <= $end)
+  .[]
   | {
       title,
       created_at,
@@ -92,7 +161,7 @@ jq -r --argjson start "$START_EPOCH" \
       .pr_info
     ]
   | @csv
-' "$RESULT_JSON" \
+' "$ALL_ITEMS" \
 | sort -t',' -k2,2 \
 | {
   printf '\xEF\xBB\xBF'
