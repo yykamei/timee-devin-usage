@@ -139,7 +139,6 @@ jq -r --slurpfile members "$MEMBERS_JSON" \
       acus_consumed,
       user_id,
       url,
-      status,
       pull_requests
     }
   | .user_name = ($user_map[.user_id // ""] // .user_id // "unknown")
@@ -157,7 +156,6 @@ jq -r --slurpfile members "$MEMBERS_JSON" \
       (.acus_consumed | tostring),
       .user_name,
       .url,
-      .status,
       .pr_info
     ]
   | @csv
@@ -165,6 +163,6 @@ jq -r --slurpfile members "$MEMBERS_JSON" \
 | sort -t',' -k2,2 \
 | {
   printf '\xEF\xBB\xBF'
-  echo '"セッション名","開始日時(JST)","消費ACU","ユーザー名","セッションURL","ステータス","PR情報"'
+  echo '"セッション名","開始日時(JST)","消費ACU","ユーザー名","セッションURL","PR情報"'
   cat
 }
