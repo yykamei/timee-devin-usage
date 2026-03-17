@@ -63,6 +63,8 @@ START_EPOCH=$(calc_start_epoch "$DAYS")
 TMPDIR_WORK=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_WORK"' EXIT
 
+INSIGHTS_JSON="${TMPDIR_WORK}/insights.json"
+
 ALL_ITEMS="${TMPDIR_WORK}/all_items.json"
 echo '[]' > "$ALL_ITEMS"
 
@@ -127,13 +129,62 @@ done
 total=$(jq 'length' "$ALL_ITEMS")
 echo "Fetched ${total} sessions total." >&2
 
-jq -r --slurpfile members "$MEMBERS_JSON" \
+# --- Phase 2: Fetch insights for each session ---
+echo "Fetching insights for each session..." >&2
+
+session_ids=$(jq -r '.[].session_id' "$ALL_ITEMS")
+
+if [[ -z "$session_ids" ]]; then
+  echo "No sessions found, skipping insights fetch." >&2
+  echo '[]' > "$INSIGHTS_JSON"
+else
+  insights_count=0
+  insights_total=$(echo "$session_ids" | wc -l | tr -d ' ')
+  : > "${TMPDIR_WORK}/insights_lines.jsonl"
+
+  while IFS= read -r sid; do
+    insights_count=$((insights_count + 1))
+    devin_id="devin-${sid}"
+    echo "  Fetching insights ${insights_count}/${insights_total}: ${devin_id}..." >&2
+
+    insights_http_code=$(curl --silent --output "${TMPDIR_WORK}/insight_response.json" \
+      --write-out "%{http_code}" \
+      --max-time 60 --connect-timeout 10 \
+      --retry 2 --retry-delay 2 \
+      --request GET \
+      --url "${API_BASE}/${devin_id}/insights" \
+      --header "Authorization: Bearer ${DEVIN_API_KEY}") || true
+
+    if [[ "$insights_http_code" -ne 200 ]]; then
+      echo "  Warning: Insights API returned HTTP ${insights_http_code} for ${devin_id}, skipping." >&2
+      jq -nc --arg sid "$sid" '{session_id: $sid, original_prompt: null}' \
+        >> "${TMPDIR_WORK}/insights_lines.jsonl"
+      continue
+    fi
+
+    jq -c --arg sid "$sid" \
+      '{session_id: $sid, original_prompt: (.analysis.suggested_prompt.original_prompt // null)}' \
+      "${TMPDIR_WORK}/insight_response.json" \
+      >> "${TMPDIR_WORK}/insights_lines.jsonl"
+
+    sleep 0.3
+  done <<< "$session_ids"
+
+  jq -s '.' "${TMPDIR_WORK}/insights_lines.jsonl" > "$INSIGHTS_JSON"
+  echo "Insights fetched for ${insights_total} sessions." >&2
+fi
+
+# --- Phase 3: Generate CSV output ---
+jq -r --slurpfile members "$MEMBERS_JSON" --slurpfile insights "$INSIGHTS_JSON" \
 '
   # Build user_id -> name lookup from members array
   ($members[0] | map({(.user_id): .name}) | add // {}) as $user_map |
+  # Build session_id -> original_prompt lookup from insights array
+  ($insights[0] | map({(.session_id): (.original_prompt // "")}) | add // {}) as $prompt_map |
 
   .[]
   | {
+      session_id,
       title,
       created_at,
       acus_consumed,
@@ -150,19 +201,21 @@ jq -r --slurpfile members "$MEMBERS_JSON" \
         [(.pull_requests // [])[] | "\(.pr_url)(\(.pr_state))"] | join(" | ")
       end
     )
+  | .prompt = ($prompt_map[.session_id] // "" | gsub("\n"; " ") | gsub("\r"; ""))
   | [
       .title,
       .created_at_jst,
       (.acus_consumed | tostring),
       .user_name,
       .url,
-      .pr_info
+      .pr_info,
+      .prompt
     ]
   | @csv
 ' "$ALL_ITEMS" \
 | sort -t',' -k2,2 \
 | {
   printf '\xEF\xBB\xBF'
-  echo '"セッション名","開始日時(JST)","消費ACU","ユーザー名","セッションURL","PR情報"'
+  echo '"セッション名","開始日時(JST)","消費ACU","ユーザー名","セッションURL","PR情報","プロンプト"'
   cat
 }
