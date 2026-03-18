@@ -60,6 +60,15 @@ calc_start_epoch() {
 
 START_EPOCH=$(calc_start_epoch "$DAYS")
 
+if date -j -f "%Y-%m-%d %H:%M:%S" "2000-01-01 00:00:00" "+%s" &>/dev/null; then
+  START_DATE=$(TZ=Asia/Tokyo date -j -v "-${DAYS}d" "+%Y-%m-%d")
+  END_DATE=$(TZ=Asia/Tokyo date -j "+%Y-%m-%d")
+else
+  START_DATE=$(TZ=Asia/Tokyo date -d "${DAYS} days ago" "+%Y-%m-%d")
+  END_DATE=$(TZ=Asia/Tokyo date "+%Y-%m-%d")
+fi
+OUTPUT_FILE="/tmp/devin-usage-${START_DATE}-${END_DATE}.csv"
+
 TMPDIR_WORK=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_WORK"' EXIT
 
@@ -218,4 +227,6 @@ jq -r --slurpfile members "$MEMBERS_JSON" --slurpfile insights "$INSIGHTS_JSON" 
   printf '\xEF\xBB\xBF'
   echo '"セッション名","開始日時(JST)","消費ACU","ユーザー名","セッションURL","PR情報","プロンプト"'
   cat
-}
+} > "$OUTPUT_FILE"
+
+echo "Report written to: ${OUTPUT_FILE}" >&2
